@@ -1,0 +1,239 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  CodeCommit to S3: Create Codecommit to S3 bucket
+Parameters:
+  RepoDescription:
+    Description: Description for this Repository
+    Default: "just My code"
+    Type: String
+  DeployBranch:
+    Description: Branch for deploy
+    Default: master
+    Type: String
+  CodeDeployEndpoint:
+    Description: Notification for CodeBuild (Email)
+    Type: String
+    Default: 'sugimoto_@arcplg.com'
+    ConstraintDescription: "This Value is set SNS Endpoint(AWS CodeDeploy)"
+
+Resources:
+  # Role
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Statement:
+              - Sid: CodeCommitFullAccess
+                Effect: Allow
+                Action: codecommit:*
+                Resource: "*"
+              - Sid: S3FullAccess
+                Effect: Allow
+                Action: s3:*
+                Resource:
+                  - !Sub arn:aws:s3:::${PipelineBucket}
+                  - !Sub arn:aws:s3:::${PipelineBucket}/*
+                  - !Sub arn:aws:s3:::${CodeBuildBucket}
+                  - !Sub arn:aws:s3:::${CodeBuildBucket}/*
+              - Sid: FullAccess
+                Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - iam:PassRole
+                Resource: "*"
+              - Sid: SNSPublishAccess
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SNSTopic
+              - Sid: CodeBuildAccess
+                Effect: Allow
+                Action:
+                  - codebuild:*
+                Resource: "*"
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Statement:
+              - Sid: CloudWatchLogsAccess
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+              - Sid: S3Access
+                Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub arn:aws:s3:::${PipelineBucket}
+                  - !Sub arn:aws:s3:::${PipelineBucket}/*
+                  - !Sub arn:aws:s3:::${CodeBuildBucket}
+                  - !Sub arn:aws:s3:::${CodeBuildBucket}/*
+                  - !Sub arn:aws:s3:::${TargetBucket}
+                  - !Sub arn:aws:s3:::${TargetBucket}/*
+              - Sid: CloudFormationAccess
+                Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: "*"
+  # DeployRole:
+  #   Type: AWS::IAM::Role
+  #   Properties:
+  #     AssumeRolePolicyDocument:
+  #       Statement:
+  #         - Effect: Allow
+  #           Principal:
+  #             Service:
+  #               - codedeploy.amazonaws.com
+  #           Action:
+  #             - sts:AssumeRole
+  #     ManagedPolicyArns:
+  #       - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+
+  # CodeCommit
+  Repository:
+    Type: AWS::CodeCommit::Repository
+    DependsOn: SNSTopic
+    Properties:
+      RepositoryName: !Ref AWS::StackName
+      RepositoryDescription: !Ref RepoDescription
+      Triggers:
+        - Name: Master-Trigger
+          CustomData: !Ref AWS::StackName
+          DestinationArn: !Ref SNSTopic
+          Branches:
+          - !Ref DeployBranch
+          Events:
+          - all
+
+  # Pipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${AWS::StackName}-dev
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: download-source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: '1'
+                Provider: CodeCommit
+              Configuration:
+                BranchName: !Ref DeployBranch
+                RepositoryName: !GetAtt Repository.Name
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: Artifact
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: '1'
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: DeployOutput
+              RunOrder: 1
+
+  CodeBuildProject:
+    DependsOn: TargetBucket
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${AWS::StackName}
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/ubuntu-base:14.04
+        EnvironmentVariables:
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: S3_BUCKET
+            Value: !Ref CodeBuildBucket
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - $(aws configure set s3.signature_version s3v4)
+            build:
+              commands:
+                - $(aws s3 sync infra s3://${TargetBucket}/ --exact-timestamps --delete --acl public-read --exclude ".git*" --quiet)
+                - echo "s3 sync complete"
+          artifacts:
+            files:
+              - code2s3.yaml
+
+  # S3 Bucket
+  TargetBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: PublicRead
+  # S3 Bucket for Pipeline
+  PipelineBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+  # S3 Bucket for Build
+  CodeBuildBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  # SNS Topic
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref CodeDeployEndpoint
+          Protocol: email
+
+Outputs:
+  PipelineUrl:
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
+    Description: CodePipeline URL
+  SiteUrl:
+    Value: !Join ['', ['https://', !GetAtt [TargetBucket, DomainName]]]
+    Description: S3 Website URL
+# CodeCommit: https://stelligent.com/2016/10/10/automating-aws-codecommit-with-cloudformation/
+# GitHub: https://stelligent.com/2017/09/05/continuous-delivery-to-s3-via-codepipeline-and-codebuild/
+

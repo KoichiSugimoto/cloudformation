@@ -1,0 +1,35 @@
+version: 0.2
+
+# env:
+  # variables:
+  #   key: "value"
+  #   key: "value"
+  # parameter-store:
+  #   key: "value"
+  #   key: "value"
+
+phases:
+  install:
+    commands:
+      - echo Entered the install phase...
+      - apt-get update -y
+  pre_build:
+    commands:
+      - echo Entered the pre_build phase...
+  build:
+    commands:
+      - echo Entered the build phase...
+      - echo Build started on `date`
+  post_build:
+    commands:
+      - echo Entered the post_build phase...
+      - echo Build completed on `date`
+artifacts:
+  files:
+    - code2s3.yaml
+  # discard-paths: yes
+  # base-directory: my-build
+# cache:
+#   paths:
+#     - path
+#     - path

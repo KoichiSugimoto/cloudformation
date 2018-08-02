@@ -1,0 +1,6 @@
+.DS_Store
+*.log
+ecs-blue-green-deployment/
+laravelaws-master/
+test/
+startup-kit-templates/

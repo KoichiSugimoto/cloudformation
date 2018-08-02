@@ -1,0 +1,647 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Pipeline
+Parameters:
+
+  NetworkStackName:
+    Type: String
+    Description: Name of an active Startup Kit CloudFormation stack that contains networking resources
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: "^[a-zA-Z][-a-zA-Z0-9]*$"
+
+  FargateStackName:
+    Type: String
+    Description: Name of an optional active Startup Kit CloudFormation stack that contains Cluster resources
+    Default: ""
+
+  GitSourceRepo:
+    Type: String
+    Description: CodeCommit or GitHub source repository - must contain a Dockerfile in the base
+
+  GitBranch:
+    Type: String
+    Default: master
+    Description: CodeCommit or GitHub git repository branch - change triggers a new build
+
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: "GitHub API token - see: https://github.com/blog/1509-personal-api-tokens"
+
+  GitHubUser:
+    Type: String
+    Description: GitHub username or organization - leave blank if using CodeCommit
+
+  CodeBuildDockerImage:
+    Type: String
+    Default: aws/codebuild/docker:17.09.0
+
+  MaxTaggedContainerImagesToRetain:
+    Type: Number
+    Description: The number of tagged container images to retain before expiring
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Value must be between 1 and 100
+    Default: 20
+
+  DaysToRetainUntaggedContainerImages:
+    Type: Number
+    Description: The number days to retain untagged container images before expiring
+    MinValue: 1
+    MaxValue: 100
+    ConstraintDescription: Value must be between 1 and 100
+    Default: 7
+
+  EnvironmentName:
+    Type: String
+    Description: Environment name - dev or prod
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    ConstraintDescription: Specify either dev or prod
+
+Conditions:
+  IsGitHub: !And
+    - !Not [ !Equals [ !Ref GitHubToken, "" ] ]
+    - !Not [ !Equals [ !Ref GitHubUser, "" ] ]
+
+  IsCodeCommit: !Not [ Condition: IsGitHub ]
+
+Resources:
+  CodePipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ecr:*
+                  - ecs:*
+              - Resource: !Sub arn:aws:s3:::${CodePipelineArtifactBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectVersion
+              - Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrDockerRepository}
+                Effect: Allow
+                Action:
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+              - Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/ecsTaskExecutionRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+
+  # By default, the build specification is defined in this template, but you can also add buildspec.yml
+  # files in your repos to allow for customization.
+  # See:
+  # https://docs.aws.amazon.com/codebuild/latest/userguide/build-spec-ref.html
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-codebuild-project-source.html
+  # CodeBuildProject:
+  #   Type: AWS::CodeBuild::Project
+  #   Properties:
+  #     Artifacts:
+  #       Type: CODEPIPELINE
+  #     Source:
+  #       Type: CODEPIPELINE
+  #       BuildSpec: !Sub
+  #         - |
+  #           ---
+  #           version: 0.2
+  #           phases:
+  #             # install:
+  #             #   commands:
+  #             #     - apt-get update && apt-get -y install python-pip && pip install --upgrade python && pip install --upgrade awscli
+  #             pre_build:
+  #                 commands:
+  #                 - printenv
+  #                 - ls -la
+  #                 - curl https://s3.amazonaws.com/amazon-ecs-cli/ecs-cli-linux-amd64-latest -o ecs-cli
+  #                 - chmod +x ./ecs-cli
+  #                 - ./ecs-cli -v
+  #                 - docker-compose build
+  #                 - TAG="$REPOSITORY_NAME.$REPOSITORY_BRANCH.$ENVIRONMENT_NAME.$(date +%Y-%m-%d.%H.%M.%S).$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | head -c 8)"
+  #                 - $(aws ecr get-login --no-include-email)
+  #                 - docker images
+  #             build:
+  #               commands:
+  #                 - echo Build started on `date`
+  #                 - echo Building the Docker image...
+  #                 - docker build --tag $REPOSITORY_URI:latest .
+  #                 - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$TAG
+  #                 # - docker-compose build
+  #                 - docker images
+  #             post_build:
+  #               commands:
+  #                 - echo Build completed on `date`
+  #                 - docker push $REPOSITORY_URI:latest
+  #                 - docker push $REPOSITORY_URI:$TAG
+  #                 - docker images
+  #                 - echo Writing image definitions file...
+  #                 - printf '[{"name":"${ServiceName}","imageUri":"%s"}]' $REPOSITORY_URI:$TAG > build.json
+  #                 - ls -la
+  #                 - cat build.json
+  #                 - sed -i -e "s/subnetID1/$SUBNET_1/" ecs-params-web.yml
+  #                 - sed -i -e "s/subnetID2/$SUBNET_2/" ecs-params-web.yml
+  #                 - sed -i -e "s/securitygroupID/$SECURITY_GROUP/" ecs-params-web.yml
+  #                 - sed -i -e "s/subnetID1/$SUBNET_1/" ecs-params-app.yml
+  #                 - sed -i -e "s/subnetID2/$SUBNET_2/" ecs-params-app.yml
+  #                 - sed -i -e "s/securitygroupID/$SECURITY_GROUP/" ecs-params-app.yml
+  #                 - cat ecs-params-web.yml
+  #                 - ./ecs-cli compose -c $ECS_CLUSTER -f aws-web.yml --project-name $CONTAINER_NAME --ecs-params ecs-params-web.yml service up --timeout 10 --target-group-arn $ALB_WEB_ARN --container-name $CONTAINER_NAME --container-port 80 --launch-type FARGATE
+  #                 - ./ecs-cli compose -c $ECS_CLUSTER -f aws-app.yml --project-name $CONTAINER_NAME --ecs-params ecs-params-app.yml service up --timeout 10 --target-group-arn $ALB_WEB_ARN --container-name $CONTAINER_NAME-laravel --container-port 9000 --launch-type FARGATE
+  #                 - ./ecs-cli ps -c $ECS_CLUSTER
+  #           artifacts:
+  #             files: build.json
+  #         - ServiceName: !Sub ${FargateStackName}
+  #     Environment:
+  #       ComputeType: BUILD_GENERAL1_SMALL
+  #       Type: LINUX_CONTAINER
+  #       Image: !Ref CodeBuildDockerImage
+  #       EnvironmentVariables:
+  #         - Name: REPOSITORY_URI
+  #           Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrDockerRepository}
+  #         - Name: ENVIRONMENT_NAME
+  #           Value: !Ref EnvironmentName
+  #         - Name: REPOSITORY_NAME
+  #           Value: !Ref GitSourceRepo
+  #         - Name: REPOSITORY_BRANCH
+  #           Value: !Ref GitBranch
+  #         - Name: ECS_CLUSTER
+  #           Value:
+  #             Fn::ImportValue: !Sub ${FargateStackName}-FargateEcsClusterName
+  #         - Name: ECS_CONTAINER
+  #           Value: !Sub ${FargateStackName}
+  #         - Name: ALB_WEB_ARN
+  #           Value:
+  #             Fn::ImportValue: !Sub ${FargateStackName}-DefaultTargetGroupArn
+  #         - Name: SUBNET_1
+  #           Value:
+  #             Fn::ImportValue: !Sub ${NetworkStackName}-PrivateSubnet1ID
+  #         - Name: SUBNET_2
+  #           Value:
+  #             Fn::ImportValue: !Sub ${NetworkStackName}-PrivateSubnet2ID
+  #         - Name: SECURITY_GROUP
+  #           Value:
+  #             Fn::ImportValue: !Sub ${NetworkStackName}-AppSecurityGroupID
+  #         - Name: CONTAINER_NAME
+  #           Value: !Sub ${FargateStackName}
+  #     Name: !Sub ${AWS::StackName}
+  #     ServiceRole: !Ref CodeBuildServiceRole
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub
+          - |
+            ---
+            version: 0.2
+            phases:
+              # install:
+              #   commands:
+              #     - apt-get update && apt-get -y install python-pip && pip install --upgrade python && pip install --upgrade awscli
+              pre_build:
+                  commands:
+                  - printenv
+                  - TAG="$REPOSITORY_NAME.$REPOSITORY_BRANCH.$ENVIRONMENT_NAME.$(date +%Y-%m-%d.%H.%M.%S).$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | head -c 8)"
+                  - $(aws ecr get-login --no-include-email)
+              build:
+                commands:
+                  - ls -la
+                  # - sed -i -e "s/private_ip//" docker/nginx/default.conf
+                  - docker build --tag $REPOSITORY_URI:$TAG-nginx --file="docker/nginx/Dockerfile" .
+                  # - docker build --tag $REPOSITORY_URI:$TAG-nginx --file="docker/nginx/Dockerfile" .
+                  - docker build --tag $REPOSITORY_URI:$TAG-laravel --file="docker/app/Dockerfile" .
+                  # - docker-compose build 2>&1 | tee -a log.txt
+                  - docker images
+              post_build:
+                commands:
+                  - docker push $REPOSITORY_URI:$TAG-nginx
+                  - printf '[{"name":"${ServiceName}","imageUri":"%s"},' $REPOSITORY_URI:$TAG-nginx > build.json
+                  # - docker push $REPOSITORY_URI:$TAG-nginx
+                  - docker push $REPOSITORY_URI:$TAG-laravel
+                  # - printf '[{"name":"${ServiceName}","imageUri":"%s"}]' $REPOSITORY_URI:$TAG-nginx > build.json
+                  - printf '{"name":"${ServiceName}-laravel","imageUri":"%s"}]' $REPOSITORY_URI:$TAG-laravel >> build.json
+                  - cat build.json
+                  # - docker-compose push 2>&1 | tee -a log.txt
+                  # - printf '[{"name":"${ServiceName}","imageUri":"%s"}]' $REPOSITORY_URI:$TAG > build.json
+            artifacts:
+              files:
+                - build.json
+                # - build-laravel.json
+          - ServiceName: !Sub ${FargateStackName}
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: !Ref CodeBuildDockerImage
+        EnvironmentVariables:
+          - Name: REPOSITORY_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrDockerRepository}
+          - Name: ENVIRONMENT_NAME
+            Value: !Ref EnvironmentName
+          - Name: REPOSITORY_NAME
+            Value: !Ref GitSourceRepo
+          - Name: REPOSITORY_BRANCH
+            Value: !Ref GitBranch
+      Name: !Sub ${AWS::StackName}
+      ServiceRole: !Ref CodeBuildServiceRole
+
+  # CodeBuildProjectLaravel:
+  #   Type: AWS::CodeBuild::Project
+  #   Properties:
+  #     Artifacts:
+  #       Type: CODEPIPELINE
+  #     Source:
+  #       Type: CODEPIPELINE
+  #       BuildSpec: !Sub
+  #         - |
+  #           ---
+  #           version: 0.2
+  #           phases:
+  #             # install:
+  #             #   commands:
+  #             #     - apt-get update && apt-get -y install python-pip && pip install --upgrade python && pip install --upgrade awscli
+  #             pre_build:
+  #                 commands:
+  #                 - printenv
+  #                 - TAG="$REPOSITORY_NAME.$REPOSITORY_BRANCH.$ENVIRONMENT_NAME.$(date +%Y-%m-%d.%H.%M.%S).$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | head -c 8)"
+  #                 - $(aws ecr get-login --no-include-email)
+  #             build:
+  #               commands:
+  #                 - ls -la
+  #                 - docker build --tag $REPOSITORY_URI:$TAG-laravel --file="docker/app/Dockerfile" .
+  #             post_build:
+  #               commands:
+  #                 - docker push $REPOSITORY_URI:$TAG-laravel
+  #                 - printf '[{"name":"${ServiceName}","imageUri":"%s"}]' $REPOSITORY_URI:$TAG-laravel > build-laravel.json
+  #           artifacts:
+  #             files: build-laravel.json
+  #         - ServiceName: !Sub ${FargateStackName}-laravel
+  #     Environment:
+  #       ComputeType: BUILD_GENERAL1_SMALL
+  #       Type: LINUX_CONTAINER
+  #       Image: !Ref CodeBuildDockerImage
+  #       EnvironmentVariables:
+  #         - Name: REPOSITORY_URI
+  #           Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrDockerRepository}
+  #         - Name: ENVIRONMENT_NAME
+  #           Value: !Ref EnvironmentName
+  #         - Name: REPOSITORY_NAME
+  #           Value: !Ref GitSourceRepo
+  #         - Name: REPOSITORY_BRANCH
+  #           Value: !Ref GitBranch
+  #     Name: !Sub ${AWS::StackName}-laravel
+  #     ServiceRole: !Ref CodeBuildServiceRole
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: codepipeline-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - ecs:List*
+                  - ecs:Describe*
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                  - iam:PassRole
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+              - Resource: !Sub arn:aws:s3:::${CodePipelineArtifactBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+    DependsOn:
+      - CodePipelineArtifactBucket
+      # - FargateEcsCluster
+
+  # This CodePipeline is used for CodeCommit repos. It triggers on a commit to the Git branch passed,
+  # builds the Docker image and then deploys the container in the Fargate Cluster. CodePipeline can support N stages.
+  # For example, you may want to add a stage to test your build and/or container.
+  CodePipelineCodeCommit:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: IsCodeCommit
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: App
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: 1
+                Provider: CodeCommit
+              Configuration:
+                RepositoryName: !Ref GitSourceRepo
+                BranchName: !Ref GitBranch
+              OutputArtifacts:
+                - Name: App
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: App
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+        # - Name: Build-laravel
+        #   Actions:
+        #     - Name: Build-laravel
+        #       ActionTypeId:
+        #         Category: Build
+        #         Owner: AWS
+        #         Version: 1
+        #         Provider: CodeBuild
+        #       Configuration:
+        #         ProjectName: !Ref CodeBuildProjectLaravel
+        #       InputArtifacts:
+        #         - Name: App
+        #       OutputArtifacts:
+        #         - Name: BuildOutput-laravel
+        #       RunOrder: 2
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: ECS
+              Configuration:
+                # ClusterName: !Ref FargateEcsCluster
+                # ServiceName: !GetAtt DefaultFargateService.Name
+                ClusterName:
+                  Fn::ImportValue: !Sub ${FargateStackName}-FargateEcsClusterName
+                ServiceName:
+                  Fn::ImportValue: !Sub ${FargateStackName}-DefaultFargateServiceName
+                FileName: build.json
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+        # - Name: Deploy-laravel
+        #   Actions:
+        #     - Name: Deploy-laravel
+        #       ActionTypeId:
+        #         Category: Deploy
+        #         Owner: AWS
+        #         Version: 1
+        #         Provider: ECS
+        #       Configuration:
+        #         ClusterName:
+        #           Fn::ImportValue: !Sub ${FargateStackName}-FargateEcsClusterName
+        #         ServiceName:
+        #           Fn::ImportValue: !Sub ${FargateStackName}-DefaultFargateServiceName
+        #         FileName: build-laravel.json
+        #       InputArtifacts:
+        #         - Name: BuildOutput-laravel
+        #       RunOrder: 2
+    DependsOn:
+      - CodePipelineArtifactBucket
+      - CodeBuildProject
+      - CodePipelineServiceRole
+      # - DefaultFargateService
+
+  # This CodePipeline is used for GitHub based repos. It triggers on a commit to the Git branch passed,
+  # builds the Docker image and then deploys the container in the Fargate Cluster. CodePipeline can support N stages.
+  # For example, you may want to add a stage to test your build and/or container.
+  CodePipelineGitHub:
+    Type: AWS::CodePipeline::Pipeline
+    Condition: IsGitHub
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodePipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: App
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              Configuration:
+                Owner: !Ref GitHubUser
+                Repo: !Ref GitSourceRepo
+                Branch: !Ref GitBranch
+                OAuthToken: !Ref GitHubToken
+              OutputArtifacts:
+                - Name: App
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: App
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+        # - Name: Build-laravel
+        #   Actions:
+        #     - Name: Build-laravel
+        #       ActionTypeId:
+        #         Category: Build
+        #         Owner: AWS
+        #         Version: 1
+        #         Provider: CodeBuild
+        #       Configuration:
+        #         ProjectName: !Ref CodeBuildProjectLaravel
+        #       InputArtifacts:
+        #         - Name: App
+        #       OutputArtifacts:
+        #         - Name: BuildOutput-laravel
+        #       RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: ECS
+              Configuration:
+                # ClusterName: !Ref FargateEcsCluster
+                # ServiceName: !GetAtt DefaultFargateService.Name
+                ClusterName:
+                  Fn::ImportValue: !Sub ${FargateStackName}-FargateEcsClusterName
+                ServiceName:
+                  Fn::ImportValue: !Sub ${FargateStackName}-DefaultFargateServiceName
+                FileName: build.json
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+        # - Name: Deploy-laravel
+        #   Actions:
+        #     - Name: Deploy-laravel
+        #       ActionTypeId:
+        #         Category: Deploy
+        #         Owner: AWS
+        #         Version: 1
+        #         Provider: ECS
+        #       Configuration:
+        #         ClusterName:
+        #           Fn::ImportValue: !Sub ${FargateStackName}-FargateEcsClusterName
+        #         ServiceName:
+        #           Fn::ImportValue: !Sub ${FargateStackName}-DefaultFargateServiceName
+        #         FileName: build-laravel.json
+        #       InputArtifacts:
+        #         - Name: BuildOutput
+        #       RunOrder: 1
+    DependsOn:
+      - CodePipelineArtifactBucket
+      - CodeBuildProject
+      # - CodeBuildProjectLaravel
+      - CodePipelineServiceRole
+      # - DefaultFargateService
+
+  # Simple Amazon ECR Lifecycle Policies to try and reduce storage costs
+  # See: https://docs.aws.amazon.com/AmazonECR/latest/userguide/LifecyclePolicies.html
+  EcrDockerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub
+          - |
+            {
+              "rules": [
+                {
+                  "rulePriority": 1,
+                  "description": "Only keep untagged images for ${DaysToRetainUntaggedContainerImages} days",
+                  "selection": {
+                    "tagStatus": "untagged",
+                    "countType": "sinceImagePushed",
+                    "countUnit": "days",
+                    "countNumber": ${DaysToRetainUntaggedContainerImages}
+                  },
+                  "action": { "type": "expire" }
+                },
+                {
+                  "rulePriority": 2,
+                  "description": "Keep only ${MaxTaggedContainerImagesToRetain} tagged images, expire all others",
+                  "selection": {
+                    "tagStatus": "tagged",
+                    "tagPrefixList": [ "${EnvironmentName}" ],
+                    "countType": "imageCountMoreThan",
+                    "countNumber": ${MaxTaggedContainerImagesToRetain}
+                  },
+                  "action": { "type": "expire" }
+                }
+              ]
+            }
+          - DaysToRetainUntaggedContainerImages: !Ref DaysToRetainUntaggedContainerImages
+            MaxTaggedContainerImagesToRetain: !Ref MaxTaggedContainerImagesToRetain
+            EnvironmentName: !Ref EnvironmentName
+Outputs:
+
+  Name:
+    Description: Pipeline Stack Name
+    Value: !Ref AWS::StackName
+    Export:
+      Name: !Sub ${AWS::StackName}-Name
+
+  EcrDockerRepositoryName:
+    Value: !Ref EcrDockerRepository
+    Export:
+      Name: !Sub ${AWS::StackName}-EcrDockerRepositoryName
+
+  EcrDockerRepositoryArn:
+    Value: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrDockerRepository}
+    Export:
+      Name: !Sub ${AWS::StackName}-EcrDockerRepositoryArn
+
+  EcrDockerRepositoryUri:
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrDockerRepository}
+    Export:
+      Name: !Sub ${AWS::StackName}-EcrDockerRepositoryUri
+
+  CodePipelineArtifactBucketName:
+    Value: !Ref CodePipelineArtifactBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-CodePipelineArtifactBucket
+
+  CodePipelineArtifactBucketArn:
+    Value: !GetAtt CodePipelineArtifactBucket.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CodePipelineArtifactBucketArn
